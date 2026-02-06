@@ -165,8 +165,8 @@ class TableRead:
         if override_num_blocks is not None and override_num_blocks < 1:
             raise ValueError(f"override_num_blocks must be at least 1, got {override_num_blocks}")
 
-        from pypaimon.read.ray_datasource import PaimonDatasource
-        datasource = PaimonDatasource(self, splits)
+        from pypaimon.read.datasource.ray_datasource import RayDatasource
+        datasource = RayDatasource(self, splits)
         return ray.data.read_datasource(
             datasource,
             ray_remote_args=ray_remote_args,
@@ -174,6 +174,17 @@ class TableRead:
             override_num_blocks=override_num_blocks,
             **read_args
         )
+
+    def to_torch(self, splits: List[Split], streaming: bool = False) -> "torch.utils.data.Dataset":
+        """Wrap Paimon table data to PyTorch Dataset."""
+        if streaming:
+            from pypaimon.read.datasource.torch_dataset import TorchIterDataset
+            dataset = TorchIterDataset(self, splits)
+            return dataset
+        else:
+            from pypaimon.read.datasource.torch_dataset import TorchDataset
+            dataset = TorchDataset(self, splits)
+            return dataset
 
     def _create_split_read(self, split: Split) -> SplitRead:
         if self.table.is_primary_key_table and not split.raw_convertible:
@@ -187,7 +198,7 @@ class TableRead:
         elif self.table.options.data_evolution_enabled():
             return DataEvolutionSplitRead(
                 table=self.table,
-                predicate=self.predicate,
+                predicate=None,  # Never push predicate to split read
                 read_type=self.read_type,
                 split=split,
                 row_tracking_enabled=True

@@ -209,6 +209,15 @@ public class HiveCatalog extends AbstractCatalog {
     }
 
     @Override
+    protected FileIO fileIO(Path path) {
+        try {
+            return FileIO.get(path, context);
+        } catch (IOException e) {
+            throw new UncheckedIOException(e);
+        }
+    }
+
+    @Override
     public Path getTableLocation(Identifier identifier) {
         Table table = null;
         try {
@@ -286,7 +295,7 @@ public class HiveCatalog extends AbstractCatalog {
                     database.getLocationUri() == null
                             ? newDatabasePath(name)
                             : new Path(database.getLocationUri());
-            locationHelper.createPathIfRequired(databasePath, fileIO);
+            locationHelper.createPathIfRequired(databasePath, fileIO(databasePath));
             locationHelper.specifyDatabaseLocation(databasePath, database);
             clients.execute(client -> client.createDatabase(database));
         } catch (TException | IOException e) {
@@ -342,6 +351,11 @@ public class HiveCatalog extends AbstractCatalog {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted in call to loadDatabaseProperties " + name, e);
         }
+    }
+
+    @Override
+    public boolean supportsPartitionModification() {
+        return true;
     }
 
     private boolean metastorePartitioned(TableSchema schema) {
@@ -442,7 +456,7 @@ public class HiveCatalog extends AbstractCatalog {
     }
 
     private String getDataFilePath(Identifier tableIdentifier, Table hmsTable) {
-        String tableLocation = getTableLocation(tableIdentifier, hmsTable).toUri().toString();
+        String tableLocation = getTableLocation(tableIdentifier, hmsTable).toString();
         return hmsTable.getParameters().containsKey(DATA_FILE_PATH_DIRECTORY.key())
                 ? tableLocation
                         + Path.SEPARATOR
@@ -478,6 +492,8 @@ public class HiveCatalog extends AbstractCatalog {
 
                 String modifyTimeSeconds = String.valueOf(partition.lastFileCreationTime() / 1000);
                 statistic.put(LAST_UPDATE_TIME_PROP, modifyTimeSeconds);
+
+                statistic.put(TOTAL_BUCKETS, String.valueOf(partition.totalBuckets()));
 
                 // just for being compatible with hive metastore
                 statistic.put(HIVE_LAST_UPDATE_TIME_PROP, modifyTimeSeconds);
@@ -558,6 +574,9 @@ public class HiveCatalog extends AbstractCatalog {
                                                     parameters.getOrDefault(
                                                             LAST_UPDATE_TIME_PROP,
                                                             System.currentTimeMillis() + ""));
+                                    int totalBuckets =
+                                            Integer.parseInt(
+                                                    parameters.getOrDefault(TOTAL_BUCKETS, "0"));
                                     return new org.apache.paimon.partition.Partition(
                                             Collections.singletonMap(
                                                     tagToPartitionField, part.getValues().get(0)),
@@ -565,6 +584,7 @@ public class HiveCatalog extends AbstractCatalog {
                                             fileSizeInBytes,
                                             fileCount,
                                             lastFileCreationTime,
+                                            totalBuckets,
                                             false);
                                 })
                         .collect(Collectors.toList());
@@ -628,8 +648,8 @@ public class HiveCatalog extends AbstractCatalog {
     protected void dropDatabaseImpl(String name) {
         try {
             Database database = clients.run(client -> client.getDatabase(name));
-            String location = locationHelper.getDatabaseLocation(database);
-            locationHelper.dropPathIfRequired(new Path(location), fileIO);
+            Path location = new Path(locationHelper.getDatabaseLocation(database));
+            locationHelper.dropPathIfRequired(location, fileIO(location));
             clients.execute(client -> client.dropDatabase(name, true, false, true));
         } catch (TException | IOException e) {
             throw new RuntimeException("Failed to drop database " + name, e);
@@ -709,6 +729,24 @@ public class HiveCatalog extends AbstractCatalog {
             Thread.currentThread().interrupt();
             throw new RuntimeException("Interrupted in call to listTables " + databaseName, e);
         }
+    }
+
+    @Override
+    public org.apache.paimon.table.Table getTable(Identifier identifier)
+            throws TableNotExistException {
+        // Hive table's location can be arbitrarily specified (inherited from the database) and may
+        // use a schema different from that of the default warehouse. Even though it is not an
+        // external table in this case, the FileIO still needs to be obtained based on the path.
+        return CatalogUtils.loadTable(
+                this,
+                identifier,
+                this::fileIO,
+                this::fileIO,
+                this::loadTableMetadata,
+                lockFactory().orElse(null),
+                lockContext().orElse(null),
+                context,
+                false);
     }
 
     @Override
@@ -1001,6 +1039,7 @@ public class HiveCatalog extends AbstractCatalog {
             // which in Hive metastore.
             Path path = getTableLocation(identifier);
             try {
+                FileIO fileIO = fileIO(path);
                 if (fileIO.exists(path)) {
                     fileIO.deleteDirectoryQuietly(path);
                 }
@@ -1066,7 +1105,7 @@ public class HiveCatalog extends AbstractCatalog {
         } catch (Exception e) {
             try {
                 if (!externalTable) {
-                    fileIO.deleteDirectoryQuietly(location);
+                    fileIO(location).deleteDirectoryQuietly(location);
                 }
             } catch (Exception ee) {
                 LOG.error("Delete directory[{}] fail for table {}", location, identifier, ee);
@@ -1128,6 +1167,7 @@ public class HiveCatalog extends AbstractCatalog {
             Path fromPath = getTableLocation(fromTable);
             Table table = renameHiveTable(fromTable, toTable);
             Path toPath = getTableLocation(toTable);
+            FileIO fileIO = fileIO(fromPath);
             if (!isExternalTable(table)
                     && !fromPath.equals(toPath)
                     && !new SchemaManager(fileIO, fromPath).listAllIds().isEmpty()) {
@@ -1641,7 +1681,7 @@ public class HiveCatalog extends AbstractCatalog {
     }
 
     private SchemaManager schemaManager(Identifier identifier, Path location) {
-        return new SchemaManager(fileIO, location, identifier.getBranchNameOrDefault());
+        return new SchemaManager(fileIO(location), location, identifier.getBranchNameOrDefault());
     }
 
     public <T> T runWithLock(Identifier identifier, Callable<T> callable) throws Exception {
@@ -1743,7 +1783,7 @@ public class HiveCatalog extends AbstractCatalog {
                 hiveConf,
                 options.get(HiveCatalogOptions.METASTORE_CLIENT_CLASS),
                 context,
-                warehouse.toUri().toString());
+                warehouse.toString());
     }
 
     public static HiveConf createHiveConf(CatalogContext context) {

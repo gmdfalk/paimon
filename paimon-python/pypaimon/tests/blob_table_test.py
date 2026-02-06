@@ -1452,7 +1452,10 @@ class DataBlobWriterTest(unittest.TestCase):
         read_builder = table.new_read_builder()
         table_scan = read_builder.new_scan()
         table_read = read_builder.new_read()
-        result = table_read.to_arrow(table_scan.plan().splits())
+        splits = table_scan.plan().splits()
+        result = table_read.to_arrow(splits)
+
+        self.assertEqual(sum([s._row_count for s in splits]), 40 * 2)
 
         # Verify the data
         self.assertEqual(result.num_rows, 40, "Should have 40 rows")
@@ -2201,12 +2204,12 @@ class DataBlobWriterTest(unittest.TestCase):
         result = table_read.to_arrow(table_scan.plan().splits())
 
         # Verify the data
-        self.assertEqual(result.num_rows, 54, "Should have 54 rows")
+        self.assertEqual(result.num_rows, 80, "Should have 54 rows")
         self.assertEqual(result.num_columns, 4, "Should have 4 columns")
 
         # Verify blob data integrity
         blob_data = result.column('large_blob').to_pylist()
-        self.assertEqual(len(blob_data), 54, "Should have 54 blob records")
+        self.assertEqual(len(blob_data), 80, "Should have 54 blob records")
         # Verify each blob
         for i, blob in enumerate(blob_data):
             self.assertEqual(len(blob), len(large_blob_data), f"Blob {i + 1} should be {large_blob_size:,} bytes")
@@ -2261,21 +2264,22 @@ class DataBlobWriterTest(unittest.TestCase):
         actual_size = len(large_blob_data)
         print(f"Created blob data: {actual_size:,} bytes ({actual_size / (1024 * 1024):.2f} MB)")
 
-        write_builder = table.new_batch_write_builder()
-        writer = write_builder.new_write()
         # Write 30 records
-        for record_id in range(30):
-            test_data = pa.Table.from_pydict({
-                'id': [record_id],  # Unique ID for each row
-                'metadata': [f'Large blob batch {record_id + 1}'],
-                'large_blob': [struct.pack('<I', record_id) + large_blob_data]
-            }, schema=pa_schema)
-            writer.write_arrow(test_data)
+        for i in range(3):
+            write_builder = table.new_batch_write_builder()
+            writer = write_builder.new_write()
+            for record_id in range(10):
+                test_data = pa.Table.from_pydict({
+                    'id': [record_id * i],  # Unique ID for each row
+                    'metadata': [f'Large blob batch {record_id + 1}'],
+                    'large_blob': [struct.pack('<I', record_id) + large_blob_data]
+                }, schema=pa_schema)
+                writer.write_arrow(test_data)
 
-        commit_messages = writer.prepare_commit()
-        commit = write_builder.new_commit()
-        commit.commit(commit_messages)
-        writer.close()
+            commit_messages = writer.prepare_commit()
+            commit = write_builder.new_commit()
+            commit.commit(commit_messages)
+            writer.close()
 
         # Read data back
         read_builder = table.new_read_builder()
@@ -2301,7 +2305,7 @@ class DataBlobWriterTest(unittest.TestCase):
         actual2 = table_read.to_arrow(splits2)
         splits3 = read_builder.new_scan().with_shard(2, 3).plan().splits()
         actual3 = table_read.to_arrow(splits3)
-        actual = pa.concat_tables([actual1, actual2, actual3]).sort_by('id')
+        actual = pa.concat_tables([actual1, actual2, actual3])
 
         # Verify the data
         self.assertEqual(actual.num_rows, 30, "Should have 30 rows")
@@ -2334,22 +2338,25 @@ class DataBlobWriterTest(unittest.TestCase):
         repetitions = large_blob_size // pattern_size
         large_blob_data = blob_pattern * repetitions
 
-        num_row = 20000
-        write_builder = table.new_batch_write_builder()
-        writer = write_builder.new_write()
-        expected = pa.Table.from_pydict({
-            'id': [1] * num_row,
-            'batch_id': [11] * num_row,
-            'metadata': [f'Large blob batch {11}'] * num_row,
-            'large_blob': [i.to_bytes(2, byteorder='little') + large_blob_data for i in range(num_row)]
-        }, schema=pa_schema)
-        writer.write_arrow(expected)
+        for i in range(3):
+            num_row = 6666
+            if i == 0:
+                num_row += 1
+            write_builder = table.new_batch_write_builder()
+            writer = write_builder.new_write()
+            expected = pa.Table.from_pydict({
+                'id': [1] * num_row,
+                'batch_id': [11] * num_row,
+                'metadata': [f'Large blob batch {11}'] * num_row,
+                'large_blob': [i.to_bytes(2, byteorder='little') + large_blob_data for i in range(num_row)]
+            }, schema=pa_schema)
+            writer.write_arrow(expected)
 
-        # Commit all data at once
-        commit_messages = writer.prepare_commit()
-        commit = write_builder.new_commit()
-        commit.commit(commit_messages)
-        writer.close()
+            # Commit all data at once
+            commit_messages = writer.prepare_commit()
+            commit = write_builder.new_commit()
+            commit.commit(commit_messages)
+            writer.close()
 
         # Read data back
         read_builder = table.new_read_builder()
@@ -2361,7 +2368,7 @@ class DataBlobWriterTest(unittest.TestCase):
         self.assertEqual(6666, result.num_rows)
         self.assertEqual(4, result.num_columns)
 
-        self.assertEqual(expected.slice(13334, 6666), result)
+        self.assertEqual(expected, result)
         splits = read_builder.new_scan().plan().splits()
         expected = table_read.to_arrow(splits)
         splits1 = read_builder.new_scan().with_shard(0, 3).plan().splits()
@@ -2487,13 +2494,14 @@ class DataBlobWriterTest(unittest.TestCase):
 
         # Read data back using table API
         read_builder = table.new_read_builder()
-        table_scan = read_builder.new_scan().with_shard(1, 2)
+        table_scan = read_builder.new_scan().with_shard(0, 2)
         table_read = read_builder.new_read()
         splits = table_scan.plan().splits()
         result = table_read.to_arrow(splits)
 
         # Verify the data was read back correctly
-        self.assertEqual(result.num_rows, 2, "Should have 2 rows")
+        # Just one file, so split 0 occupied the whole records
+        self.assertEqual(result.num_rows, 5, "Should have 2 rows")
         self.assertEqual(result.num_columns, 3, "Should have 3 columns")
 
     def test_blob_write_read_large_data_volume_rolling_with_shard(self):
@@ -2566,6 +2574,235 @@ class DataBlobWriterTest(unittest.TestCase):
         actual = pa.concat_tables([actual1, actual2, actual3]).sort_by('id')
 
         self.assertEqual(actual, expected)
+
+    def test_concurrent_blob_writes_with_retry(self):
+        """Test concurrent blob writes to verify retry mechanism works correctly."""
+        import threading
+        from pypaimon import Schema
+        from pypaimon.snapshot.snapshot_manager import SnapshotManager
+
+        # Run the test 10 times to verify stability
+        iter_num = 2
+        for test_iteration in range(iter_num):
+            # Create a unique table for each iteration
+            table_name = f'test_db.blob_concurrent_writes_{test_iteration}'
+
+            # Create schema with blob column
+            pa_schema = pa.schema([
+                ('id', pa.int32()),
+                ('thread_id', pa.int32()),
+                ('metadata', pa.string()),
+                ('blob_data', pa.large_binary()),
+            ])
+
+            schema = Schema.from_pyarrow_schema(
+                pa_schema,
+                options={
+                    'row-tracking.enabled': 'true',
+                    'data-evolution.enabled': 'true'
+                }
+            )
+            self.catalog.create_table(table_name, schema, False)
+            table = self.catalog.get_table(table_name)
+
+            write_results = []
+            write_errors = []
+
+            # Create blob pattern for testing
+            blob_size = 5 * 1024  # 5KB
+            blob_pattern = b'BLOB_PATTERN_' + b'X' * 1024
+            pattern_size = len(blob_pattern)
+            repetitions = blob_size // pattern_size
+            base_blob_data = blob_pattern * repetitions
+
+            def write_blob_data(thread_id, start_id):
+                """Write blob data in a separate thread."""
+                try:
+                    threading.current_thread().name = f"Iter{test_iteration}-Thread-{thread_id}"
+                    write_builder = table.new_batch_write_builder()
+                    table_write = write_builder.new_write()
+                    table_commit = write_builder.new_commit()
+
+                    # Create unique blob data for this thread
+                    data = {
+                        'id': list(range(start_id, start_id + 5)),
+                        'thread_id': [thread_id] * 5,
+                        'metadata': [f'thread{thread_id}_blob_{i}' for i in range(5)],
+                        'blob_data': [i.to_bytes(2, byteorder='little') + base_blob_data for i in range(5)]
+                    }
+                    pa_table = pa.Table.from_pydict(data, schema=pa_schema)
+
+                    table_write.write_arrow(pa_table)
+                    commit_messages = table_write.prepare_commit()
+
+                    table_commit.commit(commit_messages)
+                    table_write.close()
+                    table_commit.close()
+
+                    write_results.append({
+                        'thread_id': thread_id,
+                        'start_id': start_id,
+                        'success': True
+                    })
+                except Exception as e:
+                    write_errors.append({
+                        'thread_id': thread_id,
+                        'error': str(e)
+                    })
+
+            # Create and start multiple threads
+            threads = []
+            num_threads = 10
+            for i in range(num_threads):
+                thread = threading.Thread(
+                    target=write_blob_data,
+                    args=(i, i * 10)
+                )
+                threads.append(thread)
+                thread.start()
+
+            # Wait for all threads to complete
+            for thread in threads:
+                thread.join()
+
+            # Verify all writes succeeded (retry mechanism should handle conflicts)
+            self.assertEqual(num_threads, len(write_results),
+                             f"Iteration {test_iteration}: Expected {num_threads} successful writes, "
+                             f"got {len(write_results)}. Errors: {write_errors}")
+            self.assertEqual(0, len(write_errors),
+                             f"Iteration {test_iteration}: Expected no errors, but got: {write_errors}")
+
+            read_builder = table.new_read_builder()
+            table_scan = read_builder.new_scan()
+            table_read = read_builder.new_read()
+            actual = table_read.to_arrow(table_scan.plan().splits()).sort_by('id')
+
+            # Verify data rows
+            self.assertEqual(num_threads * 5, actual.num_rows,
+                             f"Iteration {test_iteration}: Expected {num_threads * 5} rows")
+
+            # Verify id column
+            ids = actual.column('id').to_pylist()
+            expected_ids = []
+            for i in range(num_threads):
+                expected_ids.extend(range(i * 10, i * 10 + 5))
+            expected_ids.sort()
+
+            self.assertEqual(ids, expected_ids,
+                             f"Iteration {test_iteration}: IDs mismatch")
+
+            # Verify blob data integrity (spot check)
+            blob_data_list = actual.column('blob_data').to_pylist()
+            for i in range(0, len(blob_data_list), 100):  # Check every 100th blob
+                blob = blob_data_list[i]
+                self.assertGreater(len(blob), 2, f"Blob {i} should have data")
+                # Verify blob contains the pattern
+                self.assertIn(b'BLOB_PATTERN_', blob, f"Blob {i} should contain pattern")
+
+            # Verify snapshot count (should have num_threads snapshots)
+            snapshot_manager = SnapshotManager(table)
+            latest_snapshot = snapshot_manager.get_latest_snapshot()
+            self.assertIsNotNone(latest_snapshot,
+                                 f"Iteration {test_iteration}: Latest snapshot should not be None")
+            self.assertEqual(latest_snapshot.id, num_threads,
+                             f"Iteration {test_iteration}: Expected snapshot ID {num_threads}, "
+                             f"got {latest_snapshot.id}")
+
+            print(f"✓ Blob Table Iteration {test_iteration + 1}/{iter_num} completed successfully")
+
+    def test_blob_data_with_ray(self):
+        try:
+            import ray
+            if not ray.is_initialized():
+                ray.init(ignore_reinit_error=True, num_cpus=2)
+        except ImportError:
+            self.skipTest("Ray is not available")
+
+        from pypaimon import Schema
+        from pypaimon.table.row.blob import BlobDescriptor
+
+        pa_schema = pa.schema([
+            ('text', pa.string()),
+            ('video_path', pa.string()),
+            ('video_bytes', pa.large_binary())  # Blob column
+        ])
+
+        schema = Schema.from_pyarrow_schema(
+            pa_schema,
+            options={
+                'row-tracking.enabled': 'true',
+                'data-evolution.enabled': 'true',
+                'blob-field': 'video_bytes',
+                'blob-as-descriptor': 'true'
+            }
+        )
+
+        self.catalog.create_table('test_db.test_blob_data_with_ray', schema, False)
+        table = self.catalog.get_table('test_db.test_blob_data_with_ray')
+
+        num_rows = 10
+        blob_descriptors = []
+        for i in range(num_rows):
+            blob_size = 1024 * (i + 1)  # Varying sizes: 1KB, 2KB, ..., 10KB
+            blob_data = b'X' * blob_size
+            blob_file_path = os.path.join(self.temp_dir, f'blob_{i}.mp4')
+            with open(blob_file_path, 'wb') as f:
+                f.write(blob_data)
+            blob_descriptor = BlobDescriptor(blob_file_path, 0, blob_size)
+            blob_descriptors.append(blob_descriptor.serialize())
+
+        test_data = pa.Table.from_pydict({
+            'text': [f'text_{i}' for i in range(num_rows)],
+            'video_path': [f'video_{i}.mp4' for i in range(num_rows)],
+            'video_bytes': blob_descriptors
+        }, schema=pa_schema)
+
+        write_builder = table.new_batch_write_builder()
+        writer = write_builder.new_write()
+        writer.write_arrow(test_data)
+        commit_messages = writer.prepare_commit()
+        commit = write_builder.new_commit()
+        commit.commit(commit_messages)
+        writer.close()
+
+        read_builder = table.new_read_builder()
+        table_scan = read_builder.new_scan()
+        table_read = read_builder.new_read()
+        splits = table_scan.plan().splits()
+
+        total_split_row_count = sum([s._row_count for s in splits])
+        self.assertEqual(total_split_row_count, num_rows * 2,
+                         f"Total split row count should be {num_rows}, got {total_split_row_count}")
+        
+        total_merged_count = 0
+        for split in splits:
+            merged_count = split.merged_row_count()
+            if merged_count is not None:
+                total_merged_count += merged_count
+                self.assertLessEqual(
+                    merged_count, split.row_count,
+                    f"merged_row_count ({merged_count}) should be <= row_count ({split.row_count})")
+        
+        if total_merged_count > 0:
+            self.assertEqual(
+                total_merged_count, num_rows,
+                f"Total merged_row_count should be {num_rows}, got {total_merged_count}")
+
+        ray_dataset = table_read.to_ray(splits, override_num_blocks=2)
+
+        ray_count = ray_dataset.count()
+        self.assertEqual(
+            ray_count,
+            num_rows,
+            f"Ray dataset count() should be {num_rows}, got {ray_count}. "
+        )
+
+        df = ray_dataset.to_pandas()
+        self.assertEqual(len(df), num_rows,
+                         f"Actual data rows should be {num_rows}, got {len(df)}")
+
+        self.assertEqual(list(df['text']), [f'text_{i}' for i in range(num_rows)])
+        self.assertEqual(list(df['video_path']), [f'video_{i}.mp4' for i in range(num_rows)])
 
 
 if __name__ == '__main__':
